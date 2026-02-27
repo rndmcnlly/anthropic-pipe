@@ -139,7 +139,7 @@ class Pipe:
 
         req: dict = {
             "model": model_id,
-            "max_tokens": body.get("max_tokens", 4096),
+            "max_tokens": body.get("max_tokens", 16384),
             "messages": messages,
             "stream": body.get("stream", False),
         }
@@ -393,6 +393,9 @@ class Pipe:
                 }],
             }
 
+        if stop_reason == "max_tokens" and text:
+            text += "\n\n---\n*[Response truncated — max_tokens limit reached]*"
+
         return text or f"(no text in response: {json.dumps(data)})"
 
 
@@ -454,7 +457,13 @@ def _translate_event(event: dict, tool_blocks: dict) -> list:
 
         if stop_reason:
             is_tool_use = stop_reason == "tool_use"
+            is_truncated = stop_reason == "max_tokens"
             finish = "tool_calls" if is_tool_use else "stop"
+
+            if is_truncated:
+                chunks.append(
+                    "\n\n---\n*[Response truncated — max_tokens limit reached]*"
+                )
 
             finish_chunk: dict = {
                 "object": "chat.completion.chunk",
