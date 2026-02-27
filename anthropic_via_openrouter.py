@@ -33,6 +33,35 @@ FALLBACK_MODELS = [
     {"id": "anthropic/claude-haiku-4-5", "name": "Claude Haiku 4.5"},
 ]
 
+# Max output tokens per model family (from Anthropic docs).
+# Checked against model_id which may have an "anthropic/" prefix.
+_MAX_OUTPUT = {
+    "claude-opus-4-6":   128_000,
+    "claude-sonnet-4-6":  64_000,
+    "claude-sonnet-4-5":  64_000,
+    "claude-opus-4-5":    64_000,
+    "claude-opus-4-1":    32_000,
+    "claude-sonnet-4":    64_000,
+    "claude-opus-4":      32_000,
+    "claude-haiku-4-5":   64_000,
+    "claude-haiku-3":      4_096,
+}
+_DEFAULT_MAX_OUTPUT = 8_192
+
+
+def _max_output_for_model(model_id: str) -> int:
+    """Return the max output token limit for a given model ID."""
+    # Strip provider prefix (e.g. "anthropic/")
+    name = model_id.split("/", 1)[-1] if "/" in model_id else model_id
+    # Try exact match first, then prefix match (handles dated snapshots like
+    # claude-sonnet-4-5-20250929)
+    if name in _MAX_OUTPUT:
+        return _MAX_OUTPUT[name]
+    for key, limit in _MAX_OUTPUT.items():
+        if name.startswith(key):
+            return limit
+    return _DEFAULT_MAX_OUTPUT
+
 
 class Pipe:
     class Valves(BaseModel):
@@ -139,7 +168,7 @@ class Pipe:
 
         req: dict = {
             "model": model_id,
-            "max_tokens": body.get("max_tokens", 16384),
+            "max_tokens": body.get("max_tokens") or _max_output_for_model(model_id),
             "messages": messages,
             "stream": body.get("stream", False),
         }
