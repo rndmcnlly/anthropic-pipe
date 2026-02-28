@@ -485,7 +485,12 @@ def _translate_event(event: dict, tool_blocks: dict) -> list:
 
     elif etype == "message_delta":
         delta = event.get("delta", {})
-        usage = event.get("usage", {}) or tool_blocks.pop("_usage", {})
+        # Merge: message_start stashed input-side usage (input_tokens, cache_*),
+        # message_delta carries output-side usage (output_tokens).  Using `or`
+        # would discard whichever dict lost, so we merge explicitly.
+        stashed = tool_blocks.pop("_usage", {})
+        delta_usage = event.get("usage", {})
+        usage = {**stashed, **delta_usage}
         stop_reason = delta.get("stop_reason")
 
         if stop_reason:
