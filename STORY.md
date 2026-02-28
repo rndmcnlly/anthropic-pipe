@@ -126,3 +126,99 @@ the same pipe works with `api.anthropic.com` directly.
   the frontend
 - A pipe should be a format translator, not a tool orchestrator
 - `uv run --script` is great for quick protocol prototyping
+
+---
+
+## The Truncation Saga
+
+Right after v3 shipped, users hit a new problem: long responses were getting
+cut off mid-sentence. The default `max_tokens` was 4096, which was fine for
+short answers but brutal for anything substantive. First fix: bump the
+default to 16,384. Then the real fix: build a `_MAX_OUTPUT` lookup table
+mapping each model family to its actual documented limit (128k for Opus 4.6,
+64k for Sonnet 4.6/4.5, 32k for Opus 4.1, etc.) and default each request
+to the model's true ceiling. Added a visible truncation warning
+("*[Response truncated — max_tokens limit reached]*") so users at least
+know when it happens.
+
+## Simplifying Caching: From Manual Breakpoints to APC
+
+The v1 caching strategy was fiddly — three manually placed `cache_control`
+breakpoints on the system prompt, first user turn, and second-to-last user
+turn. It worked but was fragile and hard to reason about as conversations
+grew.
+
+Anthropic's automatic prompt caching (APC) made all that unnecessary. The
+new strategy: place a single `cache_control` breakpoint on the last block
+of the last message. Anthropic's APC logic handles the rest — the cached
+prefix grows automatically as the conversation extends. Deleted all the
+manual breakpoint management code and the `_inject_cache_control` helper.
+Simpler and more effective.
+
+Also added OpenRouter app attribution headers (`HTTP-Referer`,
+`X-Title`) around this time — a minor thing, but OR uses them for their
+app rankings dashboard.
+
+## Extended Thinking ✨
+
+Claude 3.7 Sonnet introduced extended thinking, and the newer Claude 4.x
+models expanded it. OWUI has a `reasoning_effort` control (low/medium/
+high/max) that pipes can honour.
+
+Mapping this to Anthropic's `thinking` API parameter was straightforward —
+a budget_tokens lookup table, `temperature` forced to 1.0, `top_k`/`top_p`
+stripped (all required by the thinking spec). The streaming side needed
+handling for `thinking_delta` and `signature_delta` events, wrapping
+thinking output in `<think>` tags that OWUI renders as collapsible
+reasoning blocks.
+
+One gotcha: OpenRouter uses dots in model names (`claude-sonnet-4.6`) while
+Anthropic uses dashes (`claude-sonnet-4-6`). Added a normalisation step
+that replaces dots with dashes for consistent model family matching.
+
+## The Cache Reporting Bug 🔍
+
+After deploying thinking support, we investigated a conversation where
+cache stats showed zeros across all turns despite the pipe injecting
+`cache_control` breakpoints. Was caching broken?
+
+Pulled the conversation via the OWUI admin API and found an interesting
+pattern: most turns reported `cache_read=0, cache_write=0`, but a couple
+of tool-loop turns showed real cache activity. Inconsistent.
+
+The culprit was a single `or` operator on line 488:
+
+```python
+usage = event.get("usage", {}) or tool_blocks.pop("_usage", {})
+```
+
+Anthropic's SSE protocol splits usage across two events: `message_start`
+carries input-side tokens (including `cache_read_input_tokens` and
+`cache_creation_input_tokens`), while `message_delta` carries output-side
+tokens. The pipe stashed the `message_start` usage and retrieved it at
+`message_delta` time.
+
+The bug: Python's `or` on dicts returns the first truthy dict. When
+`message_delta` had `{"output_tokens": 61}`, that's truthy — so the
+stashed dict with all the cache fields was silently dropped. The fix:
+merge both dicts explicitly with `{**stashed, **delta_usage}`.
+
+Whether cache stats showed up before the fix depended entirely on whether
+OpenRouter happened to include cache fields in the `message_delta` event
+(sometimes it did, sometimes it didn't). A classic intermittent bug
+caused by a Python footgun.
+
+## Does Caching Actually Work on 4.6?
+
+After fixing the reporting bug, we tested caching on `claude-sonnet-4.6`
+and discovered that OpenRouter's prompt caching docs didn't list 4.6 models
+as supported. Suspicious. But direct API testing with large prompts
+(10k+ tokens) confirmed: **caching works fine on Sonnet 4.6 via
+OpenRouter.** Cache write on request 1, cache read on request 2, 12x cost
+reduction. OpenRouter's docs just hadn't been updated yet.
+
+The real reason the test conversation showed zeros: it was too short.
+Anthropic requires a minimum of 1024 tokens in the cacheable prefix for
+Sonnet-class models. Once the conversation grew past that threshold,
+`cache_write` appeared, and subsequent turns showed `cache_read` with
+`prompt_tokens` dropping to single digits. APC working exactly as designed.
