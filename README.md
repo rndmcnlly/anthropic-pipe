@@ -8,8 +8,9 @@ endpoint.
 ## What it does
 
 - Translates OpenAI ↔ Anthropic message formats (text, images, tool calls)
-- Injects `cache_control` breakpoints on the system prompt, first user turn,
-  and second-to-last user turn (~10x cheaper on cache hits)
+- Enables Automatic Prompt Caching (APC): a single `cache_control` breakpoint
+  on the last message block lets Anthropic advance the cache prefix automatically
+  as the conversation grows (~10x cheaper on cache hits)
 - Emits tool calls in OpenAI format so OWUI's native middleware handles
   execution and renders the standard collapsible tool-call UI
 - Forwards token usage and cost to OWUI's info display
@@ -27,9 +28,7 @@ endpoint.
 | `API_KEY` | | Required |
 | `API_BASE_URL` | `https://openrouter.ai/api/v1` | `https://api.anthropic.com` for direct |
 | `AUTH_TYPE` | `bearer` | `x-api-key` for direct Anthropic |
-| `CACHE_SYSTEM_PROMPT` | `true` | |
-| `CACHE_CONVERSATION` | `true` | |
-| `CACHE_TTL` | `5m` | `5m` or `1h` |
+| `CACHE_TTL` | `5m` | `5m` (1.25x write cost) or `1h` (2x write cost) |
 
 ## License
 

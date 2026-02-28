@@ -25,7 +25,17 @@ print(json.dumps({
     'id': 'anthropic_via_openrouter',
     'name': 'Anthropic via OpenRouter',
     'content': content,
-    'meta': {'description': 'Native Anthropic pipe with prompt caching and tool support.', 'manifest': {}}
+    'meta': {
+        'description': 'Native Anthropic pipe with prompt caching and tool support.',
+        'manifest': {
+            'title': 'Anthropic Pipe',
+            'author': 'Adam Smith',
+            'author_url': 'https://adamsmith.as',
+            'version': '3.2.0',
+            'license': 'MIT',
+            'description': '>'
+        }
+    }
 }))
 ")"
 ```
@@ -41,8 +51,6 @@ curl -s -X POST \
     \"API_KEY\": \"sk-or-v1-...\",
     \"API_BASE_URL\": \"https://openrouter.ai/api/v1\",
     \"AUTH_TYPE\": \"bearer\",
-    \"CACHE_SYSTEM_PROMPT\": true,
-    \"CACHE_CONVERSATION\": true,
     \"CACHE_TTL\": \"5m\"
   }"
 ```
@@ -73,7 +81,17 @@ print(json.dumps({
     'id': 'anthropic_via_openrouter',
     'name': 'Anthropic via OpenRouter',
     'content': content,
-    'meta': {'description': 'Native Anthropic pipe with prompt caching and tool support.', 'manifest': {}}
+    'meta': {
+        'description': 'Native Anthropic pipe with prompt caching and tool support.',
+        'manifest': {
+            'title': 'Anthropic Pipe',
+            'author': 'Adam Smith',
+            'author_url': 'https://adamsmith.as',
+            'version': '3.2.0',
+            'license': 'MIT',
+            'description': '>'
+        }
+    }
 }))
 ")"
 ```
