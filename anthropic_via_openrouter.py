@@ -98,7 +98,12 @@ class Pipe:
             if self.valves.AUTH_TYPE == "x-api-key"
             else {"Authorization": f"Bearer {self.valves.API_KEY}"}
         )
-        return {**auth, "anthropic-version": ANTHROPIC_VERSION, "Content-Type": "application/json"}
+        or_attribution = (
+            {"HTTP-Referer": "https://openwebui.com/", "X-Title": "Open WebUI"}
+            if "openrouter.ai" in self._base()
+            else {}
+        )
+        return {**auth, **or_attribution, "anthropic-version": ANTHROPIC_VERSION, "Content-Type": "application/json"}
 
     # ------------------------------------------------------------------
     # Model list
