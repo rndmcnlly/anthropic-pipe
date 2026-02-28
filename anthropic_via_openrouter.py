@@ -2,13 +2,14 @@
 title: Anthropic Pipe
 author: Adam Smith
 author_url: https://adamsmith.as
-version: 3.2.0
+version: 4.0.0
 license: MIT
 description: >
   Native Anthropic Messages API pipe for Open WebUI with prompt caching.
   Defaults to OpenRouter but works with any Anthropic-compatible endpoint.
   Tool calls are translated to OpenAI format so OWUI's native middleware
   handles execution, UI rendering, and multi-turn tool loops.
+  Supports extended thinking via OWUI's reasoning_effort control.
 """
 # Prompt caching strategy: automatic prompt caching (APC).
 # A single cache_control breakpoint is placed on the last message block so
@@ -48,10 +49,32 @@ _MAX_OUTPUT = {
 }
 _DEFAULT_MAX_OUTPUT = 8_192
 
+# Extended thinking: OWUI reasoning_effort → budget_tokens.
+# Matches the official anthropic_manifold_pipeline pattern.
+_THINKING_BUDGET = {
+    "low": 1024,
+    "medium": 4096,
+    "high": 16384,
+    "max": 32768,
+}
+# Model families that support extended thinking (substring match on model ID).
+_THINKING_FAMILIES = ("claude-3-7", "claude-sonnet-4", "claude-opus-4", "claude-haiku-4")
+
+
+def _model_name(model_id: str) -> str:
+    """Strip provider prefix, normalise dots→dashes for consistent matching."""
+    name = model_id.split("/", 1)[-1] if "/" in model_id else model_id
+    return name.replace(".", "-")
+
+
+def _supports_thinking(model_id: str) -> bool:
+    name = _model_name(model_id)
+    return any(family in name for family in _THINKING_FAMILIES)
+
 
 def _max_output_for_model(model_id: str) -> int:
     """Return the max output token limit for a given model ID."""
-    name = model_id.split("/", 1)[-1] if "/" in model_id else model_id
+    name = _model_name(model_id)
     if name in _MAX_OUTPUT:
         return _MAX_OUTPUT[name]
     for key, limit in _MAX_OUTPUT.items():
@@ -150,9 +173,11 @@ class Pipe:
 
         tools = self._convert_tools(body.get("tools", []))
 
+        max_tokens = body.get("max_tokens") or _max_output_for_model(model_id)
+
         req: dict = {
             "model": model_id,
-            "max_tokens": body.get("max_tokens") or _max_output_for_model(model_id),
+            "max_tokens": max_tokens,
             "messages": messages,
             "stream": body.get("stream", False),
         }
@@ -160,9 +185,31 @@ class Pipe:
             req["system"] = [{"type": "text", "text": system_text}]
         if tools:
             req["tools"] = tools
-        for key in ("temperature", "top_p", "top_k", "stop"):
-            if key in body:
-                req[key] = body[key]
+
+        # -- Reasoning effort → Anthropic extended thinking --
+        effort = str(body.get("reasoning_effort", "")).lower().strip()
+        budget_tokens = _THINKING_BUDGET.get(effort)
+        # Also accept raw integer budget (OWUI passes strings)
+        if not budget_tokens and effort not in ("", "none"):
+            try:
+                budget_tokens = int(effort)
+            except (ValueError, TypeError):
+                budget_tokens = None
+
+        thinking_enabled = False
+        if budget_tokens and _supports_thinking(model_id):
+            req["thinking"] = {"type": "enabled", "budget_tokens": budget_tokens}
+            thinking_enabled = True
+
+        if thinking_enabled:
+            # Thinking requires temperature=1 and is incompatible with top_k/top_p
+            req["temperature"] = 1.0
+            if "stop" in body:
+                req["stop"] = body["stop"]
+        else:
+            for key in ("temperature", "top_p", "top_k", "stop"):
+                if key in body:
+                    req[key] = body[key]
 
         if body.get("stream", False):
             return self._stream(req)
@@ -338,7 +385,14 @@ class Pipe:
         content = data.get("content", [])
         stop_reason = data.get("stop_reason", "end_turn")
 
-        text = "\n".join(b["text"] for b in content if b.get("type") == "text")
+        # Collect thinking blocks and text blocks separately
+        thinking_parts = [b["thinking"] for b in content if b.get("type") == "thinking" and b.get("thinking")]
+        text_parts = [b["text"] for b in content if b.get("type") == "text"]
+        text = "\n".join(text_parts)
+
+        # Prepend thinking in <think> tags (OWUI renders these natively)
+        if thinking_parts:
+            text = "<think>" + "\n".join(thinking_parts) + "</think>\n\n" + text
 
         # If the model wants to call tools, translate to OAI format
         # so OWUI's middleware can intercept and execute them.
@@ -391,6 +445,7 @@ def _translate_event(event: dict, tool_blocks: dict) -> list:
 
     The special key "_usage" in tool_blocks stores usage from message_start
     for providers (like direct Anthropic) that don't repeat it in message_delta.
+    The special key "_thinking" tracks whether we're inside a thinking block.
     """
     etype = event.get("type")
     chunks: list = []
@@ -400,6 +455,12 @@ def _translate_event(event: dict, tool_blocks: dict) -> list:
         dt = delta.get("type")
         if dt == "text_delta":
             chunks.append(delta.get("text", ""))
+        elif dt == "thinking_delta":
+            chunks.append(delta.get("thinking", ""))
+        elif dt == "signature_delta":
+            # Signature marks end of thinking block → close the <think> tag
+            chunks.append("\n</think>\n\n")
+            tool_blocks.pop("_thinking", None)
         elif dt == "input_json_delta":
             idx = event.get("index", 0)
             if idx in tool_blocks:
@@ -410,11 +471,17 @@ def _translate_event(event: dict, tool_blocks: dict) -> list:
         idx = event.get("index", 0)
         if block.get("type") == "tool_use":
             tool_blocks[idx] = {"id": block.get("id", ""), "name": block.get("name", ""), "_json": ""}
+        elif block.get("type") == "thinking":
+            tool_blocks["_thinking"] = True
+            chunks.append("<think>")
 
     elif etype == "content_block_stop":
         idx = event.get("index", 0)
         if idx in tool_blocks:
             tool_blocks[idx]["arguments"] = tool_blocks[idx].pop("_json", "{}")
+        # Fallback close if signature_delta didn't fire (e.g. redacted thinking)
+        if tool_blocks.pop("_thinking", False):
+            chunks.append("\n</think>\n\n")
 
     elif etype == "message_delta":
         delta = event.get("delta", {})
@@ -441,7 +508,7 @@ def _translate_event(event: dict, tool_blocks: dict) -> list:
                         "type": "function",
                         "function": {"name": tb["name"], "arguments": tb.get("arguments", "{}")},
                     }
-                    for i, tb in enumerate(tool_blocks[k] for k in sorted(tool_blocks))
+                    for i, tb in enumerate(tool_blocks[k] for k in sorted(k for k in tool_blocks if isinstance(k, int)))
                 ]
                 tool_blocks.clear()
 
