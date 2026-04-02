@@ -2,7 +2,7 @@
 title: Anthropic Pipe
 author: Adam Smith
 author_url: https://adamsmith.as
-version: 4.0.0
+version: 4.0.1
 license: MIT
 description: >
   Native Anthropic Messages API pipe for Open WebUI with prompt caching.
@@ -394,6 +394,33 @@ class Pipe:
         if thinking_parts:
             text = "<think>" + "\n".join(thinking_parts) + "</think>\n\n" + text
 
+        # ── Build OAI usage from Anthropic usage ─────────────────
+        anthropic_usage = data.get("usage", {})
+        prompt_tokens = anthropic_usage.get("input_tokens", 0)
+        completion_tokens = anthropic_usage.get("output_tokens", 0)
+        cache_read = anthropic_usage.get("cache_read_input_tokens", 0)
+        cache_write = anthropic_usage.get("cache_creation_input_tokens", 0)
+        oai_usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        if cache_read or cache_write:
+            oai_usage["prompt_tokens_details"] = {
+                "cached_tokens": cache_read,
+                "cache_write_tokens": cache_write,
+            }
+
+        # ── Build response envelope ──────────────────────────────
+        import uuid, time as _time
+        envelope = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            "object": "chat.completion",
+            "created": int(_time.time()),
+            "model": body.get("model", ""),
+            "usage": oai_usage,
+        }
+
         # If the model wants to call tools, translate to OAI format
         # so OWUI's middleware can intercept and execute them.
         tool_uses = [b for b in content if b.get("type") == "tool_use"]
@@ -410,22 +437,29 @@ class Pipe:
                 }
                 for i, tu in enumerate(tool_uses)
             ]
-            return {
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": text or None,
-                        "tool_calls": oai_tool_calls,
-                    },
-                    "finish_reason": "tool_calls",
-                }],
-            }
+            envelope["choices"] = [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": text or None,
+                    "tool_calls": oai_tool_calls,
+                },
+                "finish_reason": "tool_calls",
+            }]
+            return envelope
 
         if stop_reason == "max_tokens" and text:
             text += "\n\n---\n*[Response truncated — max_tokens limit reached]*"
 
-        return text or f"(no text in response: {json.dumps(data)})"
+        envelope["choices"] = [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": text or f"(no text in response: {json.dumps(data)})",
+            },
+            "finish_reason": "length" if stop_reason == "max_tokens" else "stop",
+        }]
+        return envelope
 
 
 # ======================================================================
