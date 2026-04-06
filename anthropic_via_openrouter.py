@@ -2,14 +2,16 @@
 title: Anthropic Pipe
 author: Adam Smith
 author_url: https://adamsmith.as
-version: 4.0.1
+version: 5.0.0
 license: MIT
 description: >
   Native Anthropic Messages API pipe for Open WebUI with prompt caching.
   Defaults to OpenRouter but works with any Anthropic-compatible endpoint.
   Tool calls are translated to OpenAI format so OWUI's native middleware
   handles execution, UI rendering, and multi-turn tool loops.
-  Supports extended thinking via OWUI's reasoning_effort control.
+  Supports extended thinking via reasoning_effort, OpenRouter-style reasoning
+  object, and verbosity. Claude 4.6 uses adaptive thinking by default;
+  older models use proportional budget_tokens allocation.
 """
 # Prompt caching strategy: automatic prompt caching (APC).
 # A single cache_control breakpoint is placed on the last message block so
@@ -29,9 +31,9 @@ log = logging.getLogger(__name__)
 ANTHROPIC_VERSION = "2023-06-01"
 
 FALLBACK_MODELS = [
+    {"id": "anthropic/claude-sonnet-4-6", "name": "Claude Sonnet 4.6"},
+    {"id": "anthropic/claude-opus-4-6", "name": "Claude Opus 4.6"},
     {"id": "anthropic/claude-sonnet-4-5", "name": "Claude Sonnet 4.5"},
-    {"id": "anthropic/claude-opus-4-5", "name": "Claude Opus 4.5"},
-    {"id": "anthropic/claude-haiku-4-5", "name": "Claude Haiku 4.5"},
 ]
 
 # Max output tokens per model family (from Anthropic docs).
@@ -49,16 +51,27 @@ _MAX_OUTPUT = {
 }
 _DEFAULT_MAX_OUTPUT = 8_192
 
-# Extended thinking: OWUI reasoning_effort → budget_tokens.
-# Matches the official anthropic_manifold_pipeline pattern.
-_THINKING_BUDGET = {
-    "low": 1024,
-    "medium": 4096,
-    "high": 16384,
-    "max": 32768,
-}
 # Model families that support extended thinking (substring match on model ID).
 _THINKING_FAMILIES = ("claude-3-7", "claude-sonnet-4", "claude-opus-4", "claude-haiku-4")
+
+# 4.6 models use adaptive thinking by default; budget_tokens is deprecated.
+_ADAPTIVE_FAMILIES = ("claude-opus-4-6", "claude-sonnet-4-6")
+
+# 4.6 models support the effort parameter (output_config.effort).
+_EFFORT_FAMILIES = ("claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-5")
+
+# Models that support effort: "max" (only 4.6).
+_MAX_EFFORT_FAMILIES = ("claude-opus-4-6", "claude-sonnet-4-6")
+
+# Effort → proportion of max_tokens for budget_tokens calculation
+# (used for non-adaptive models when effort is specified instead of explicit budget).
+_EFFORT_RATIOS = {
+    "xhigh":  0.95,
+    "high":   0.80,
+    "medium": 0.50,
+    "low":    0.20,
+    "minimal": 0.10,
+}
 
 
 def _model_name(model_id: str) -> str:
@@ -70,6 +83,24 @@ def _model_name(model_id: str) -> str:
 def _supports_thinking(model_id: str) -> bool:
     name = _model_name(model_id)
     return any(family in name for family in _THINKING_FAMILIES)
+
+
+def _uses_adaptive_thinking(model_id: str) -> bool:
+    """True for 4.6 models where adaptive thinking replaces budget_tokens."""
+    name = _model_name(model_id)
+    return any(family in name for family in _ADAPTIVE_FAMILIES)
+
+
+def _supports_effort(model_id: str) -> bool:
+    """True for models supporting output_config.effort (verbosity)."""
+    name = _model_name(model_id)
+    return any(family in name for family in _EFFORT_FAMILIES)
+
+
+def _supports_max_effort(model_id: str) -> bool:
+    """True for models supporting effort: 'max' (4.6 only)."""
+    name = _model_name(model_id)
+    return any(family in name for family in _MAX_EFFORT_FAMILIES)
 
 
 def _max_output_for_model(model_id: str) -> int:
@@ -186,21 +217,75 @@ class Pipe:
         if tools:
             req["tools"] = tools
 
-        # -- Reasoning effort → Anthropic extended thinking --
-        effort = str(body.get("reasoning_effort", "")).lower().strip()
-        budget_tokens = _THINKING_BUDGET.get(effort)
-        # Also accept raw integer budget (OWUI passes strings)
-        if not budget_tokens and effort not in ("", "none"):
-            try:
-                budget_tokens = int(effort)
-            except (ValueError, TypeError):
-                budget_tokens = None
+        # -- Reasoning / thinking configuration --
+        # Accept three input shapes from OWUI / callers:
+        #   1. body["reasoning"]        — OpenRouter-style dict {effort, max_tokens, exclude, enabled}
+        #   2. body["reasoning_effort"] — flat string ("low"/"medium"/"high"/"max" or raw int)
+        #   3. Neither                  — no thinking requested
+        reasoning_cfg = body.get("reasoning") or {}
+        if isinstance(reasoning_cfg, str):
+            reasoning_cfg = {"effort": reasoning_cfg}
+
+        # Normalise effort from either source
+        effort = (
+            str(reasoning_cfg.get("effort", "")).lower().strip()
+            or str(body.get("reasoning_effort", "")).lower().strip()
+        )
+        explicit_budget = reasoning_cfg.get("max_tokens")  # explicit token budget
+        reasoning_enabled = reasoning_cfg.get("enabled", False)
 
         thinking_enabled = False
-        if budget_tokens and _supports_thinking(model_id):
-            req["thinking"] = {"type": "enabled", "budget_tokens": budget_tokens}
-            thinking_enabled = True
+        if _supports_thinking(model_id):
+            if _uses_adaptive_thinking(model_id):
+                # Claude 4.6: prefer adaptive thinking over budget_tokens.
+                # Enable if: explicit budget given, effort specified, or enabled flag set.
+                should_think = bool(explicit_budget or effort not in ("", "none") or reasoning_enabled)
+                if should_think:
+                    if explicit_budget:
+                        # Caller gave an explicit budget — use budget-based (still supported).
+                        req["thinking"] = {"type": "enabled", "budget_tokens": int(explicit_budget)}
+                    else:
+                        # Adaptive: model decides how much to think; effort controls depth
+                        # via output_config.effort (handled below).
+                        req["thinking"] = {"type": "adaptive"}
+                    thinking_enabled = True
+            else:
+                # Pre-4.6 models: budget-based thinking.
+                budget_tokens = None
+                if explicit_budget:
+                    budget_tokens = int(explicit_budget)
+                elif effort in _EFFORT_RATIOS:
+                    # Proportional: effort → percentage of max_tokens (like OpenRouter)
+                    budget_tokens = max(1024, min(int(max_tokens * _EFFORT_RATIOS[effort]), 128_000))
+                elif effort not in ("", "none"):
+                    # Accept raw integer budget (OWUI passes strings)
+                    try:
+                        budget_tokens = int(effort)
+                    except (ValueError, TypeError):
+                        budget_tokens = None
 
+                if budget_tokens:
+                    req["thinking"] = {"type": "enabled", "budget_tokens": budget_tokens}
+                    thinking_enabled = True
+
+        # -- Effort / verbosity → output_config.effort --
+        # Separate from thinking: controls response thoroughness and token spend.
+        # Accept from reasoning.effort, reasoning_effort, or standalone verbosity param.
+        verbosity = str(body.get("verbosity", "")).lower().strip()
+        eff_source = effort or verbosity
+        if eff_source and eff_source != "none" and _supports_effort(model_id):
+            # Map effort to Anthropic's output_config.effort values
+            eff_val = eff_source if eff_source in ("low", "medium", "high", "max") else "high"
+            if eff_val == "max" and not _supports_max_effort(model_id):
+                eff_val = "high"
+            # xhigh/minimal → nearest supported level
+            if eff_source == "xhigh":
+                eff_val = "max" if _supports_max_effort(model_id) else "high"
+            elif eff_source == "minimal":
+                eff_val = "low"
+            req["output_config"] = {"effort": eff_val}
+
+        # -- Sampling constraints when thinking is active --
         if thinking_enabled:
             # Thinking requires temperature=1 and is incompatible with top_k/top_p
             req["temperature"] = 1.0
