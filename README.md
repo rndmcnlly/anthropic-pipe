@@ -17,6 +17,22 @@ endpoint.
 
 ## Install
 
+### Via CLI (recommended)
+
+```bash
+export OWUI_URL=https://your-owui-instance.example.com
+export OWUI_TOKEN=your-api-token        # Admin Settings → Account → API Keys
+
+uvx owui-cli functions deploy anthropic_via_openrouter.py anthropic_via_openrouter
+uvx owui-cli functions toggle anthropic_via_openrouter
+uvx owui-cli functions toggle-global anthropic_via_openrouter
+```
+
+Then set the `API_KEY` valve to your OpenRouter or Anthropic key (Admin UI or
+`uvx owui-cli` — see `uvx owui-cli --help` for valve endpoints).
+
+### Via Admin UI
+
 1. **Admin → Functions → New Function**, paste `anthropic_via_openrouter.py`
 2. Set the `API_KEY` valve to your OpenRouter or Anthropic key
 3. Toggle **Active** and **Global**
