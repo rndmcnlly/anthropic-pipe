@@ -1,99 +1,38 @@
 # Deploying to chat.adamsmith.as
 
-## Keys
+## Prerequisites
 
-- OWUI admin API key: `~/.tokens/chat-adamsmith-as-admin`
-- OpenRouter API key: generate a temporary one at https://openrouter.ai/keys
+- `~/.tokens/owui/chat-adamsmith-as` — sources `OWUI_URL` and `OWUI_TOKEN`
+- OpenRouter API key configured in the pipe's valves (Admin UI or CLI)
 
 ## Function ID
 
 `anthropic_via_openrouter`
 
-## Create (first time)
+## Deploy (create or update)
 
 ```bash
-OWUI_KEY=$(cat ~/.tokens/chat-adamsmith-as-admin)
-
-curl -s -X POST \
-  -H "Authorization: Bearer $OWUI_KEY" \
-  -H "Content-Type: application/json" \
-  https://chat.adamsmith.as/api/v1/functions/create \
-  -d "$(python3 -c "
-import json
-content = open('anthropic_via_openrouter.py').read()
-print(json.dumps({
-    'id': 'anthropic_via_openrouter',
-    'name': 'Anthropic via OpenRouter',
-    'content': content,
-    'meta': {
-        'description': 'Native Anthropic pipe with prompt caching and tool support.',
-        'manifest': {
-            'title': 'Anthropic Pipe',
-            'author': 'Adam Smith',
-            'author_url': 'https://adamsmith.as',
-            'version': '3.2.0',
-            'license': 'MIT',
-            'description': '>'
-        }
-    }
-}))
-")"
+source ~/.tokens/owui/chat-adamsmith-as
+uvx owui-cli functions deploy anthropic_via_openrouter.py anthropic_via_openrouter
 ```
 
-## Set valves
+Valves and toggle state are preserved across code updates.
+
+## First-time setup
+
+After the initial deploy, set valves and activate:
 
 ```bash
-curl -s -X POST \
-  -H "Authorization: Bearer $OWUI_KEY" \
-  -H "Content-Type: application/json" \
-  https://chat.adamsmith.as/api/v1/functions/id/anthropic_via_openrouter/valves/update \
-  -d "{
-    \"API_KEY\": \"sk-or-v1-...\",
-    \"API_BASE_URL\": \"https://openrouter.ai/api/v1\",
-    \"AUTH_TYPE\": \"bearer\",
-    \"CACHE_TTL\": \"5m\"
-  }"
+# Set valves (Admin → Functions → anthropic_via_openrouter → Valves)
+# Or via the API — see `uvx owui-cli schema functions` for endpoints.
+
+# Toggle active + global
+uvx owui-cli functions toggle anthropic_via_openrouter
+uvx owui-cli functions toggle-global anthropic_via_openrouter
 ```
 
-## Activate and make global
+## Verify
 
 ```bash
-curl -s -X POST -H "Authorization: Bearer $OWUI_KEY" \
-  https://chat.adamsmith.as/api/v1/functions/id/anthropic_via_openrouter/toggle
-
-curl -s -X POST -H "Authorization: Bearer $OWUI_KEY" \
-  https://chat.adamsmith.as/api/v1/functions/id/anthropic_via_openrouter/toggle/global
+uvx owui-cli functions list
 ```
-
-## Update (push new code)
-
-```bash
-OWUI_KEY=$(cat ~/.tokens/chat-adamsmith-as-admin)
-
-curl -s -X POST \
-  -H "Authorization: Bearer $OWUI_KEY" \
-  -H "Content-Type: application/json" \
-  https://chat.adamsmith.as/api/v1/functions/id/anthropic_via_openrouter/update \
-  -d "$(python3 -c "
-import json
-content = open('anthropic_via_openrouter.py').read()
-print(json.dumps({
-    'id': 'anthropic_via_openrouter',
-    'name': 'Anthropic via OpenRouter',
-    'content': content,
-    'meta': {
-        'description': 'Native Anthropic pipe with prompt caching and tool support.',
-        'manifest': {
-            'title': 'Anthropic Pipe',
-            'author': 'Adam Smith',
-            'author_url': 'https://adamsmith.as',
-            'version': '3.2.0',
-            'license': 'MIT',
-            'description': '>'
-        }
-    }
-}))
-")"
-```
-
-Valves are preserved across code updates. Toggle state is also preserved.

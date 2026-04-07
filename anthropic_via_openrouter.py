@@ -428,7 +428,14 @@ class Pipe:
         pipe = self
 
         async def generator():
+            import uuid, time as _time
             tool_blocks: dict = {}
+            # Consistent envelope fields for all dict chunks in this stream.
+            # OWUI adds these for plain-string yields but passes dicts through
+            # as-is, so pre-formed chunks (tool calls, usage) need them too.
+            stream_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            stream_model = body.get("model", "")
+            stream_created = int(_time.time())
             async with httpx.AsyncClient(timeout=300) as client:
                 async with client.stream(
                     "POST", f"{pipe._base()}/messages",
@@ -449,6 +456,11 @@ class Pipe:
                         except json.JSONDecodeError:
                             continue
                         for chunk in _translate_event(event, tool_blocks):
+                            if isinstance(chunk, dict):
+                                # Ensure required OAI envelope fields are present
+                                chunk.setdefault("id", stream_id)
+                                chunk.setdefault("model", stream_model)
+                                chunk.setdefault("created", stream_created)
                             yield chunk
 
         return generator()
