@@ -119,6 +119,7 @@ class Pipe:
         API_KEY: str = Field(
             default="",
             description="API key: an OpenRouter key or a native Anthropic key.",
+            json_schema_extra={"input": {"type": "password"}},
         )
         API_BASE_URL: str = Field(
             default="https://openrouter.ai/api/v1",
