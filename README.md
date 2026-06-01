@@ -14,6 +14,12 @@ endpoint.
 - Emits tool calls in OpenAI format so OWUI's native middleware handles
   execution and renders the standard collapsible tool-call UI
 - Forwards token usage and cost to OWUI's info display
+- Derives per-model capabilities (max output, thinking mode, effort levels)
+  from a parsed `(family, major, minor)` version, so new releases work without
+  code edits. This covers `4.7`/`4.8`, the `-fast` speed variants, and the
+  `~anthropic/claude-…-latest` aliases. On Opus 4.7+ (adaptive-thinking-only)
+  it sends `thinking: {type: "adaptive"}`, honors `xhigh` effort natively, and
+  drops `temperature`/`top_p`/`top_k`, which those models reject.
 
 ## Install
 

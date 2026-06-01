@@ -2,7 +2,7 @@
 title: Anthropic Pipe
 author: Adam Smith
 author_url: https://adamsmith.as
-version: 5.0.0
+version: 5.1.0
 license: MIT
 description: >
   Native Anthropic Messages API pipe for Open WebUI with prompt caching.
@@ -10,8 +10,12 @@ description: >
   Tool calls are translated to OpenAI format so OWUI's native middleware
   handles execution, UI rendering, and multi-turn tool loops.
   Supports extended thinking via reasoning_effort, OpenRouter-style reasoning
-  object, and verbosity. Claude 4.6 uses adaptive thinking by default;
-  older models use proportional budget_tokens allocation.
+  object, and verbosity. Claude 4.6+ uses adaptive thinking; on Opus 4.7+
+  adaptive is the *only* mode (manual budget_tokens is rejected with a 400).
+  Older models use proportional budget_tokens allocation. Model capabilities
+  are derived from a parsed (family, major, minor) version, so new releases
+  (e.g. 4.7, 4.8, '-fast' speed variants, and '~...-latest' aliases) are
+  handled without per-version edits.
 """
 # Prompt caching strategy: automatic prompt caching (APC).
 # A single cache_control breakpoint is placed on the last message block so
@@ -31,37 +35,14 @@ log = logging.getLogger(__name__)
 ANTHROPIC_VERSION = "2023-06-01"
 
 FALLBACK_MODELS = [
-    {"id": "anthropic/claude-sonnet-4-6", "name": "Claude Sonnet 4.6"},
-    {"id": "anthropic/claude-opus-4-6", "name": "Claude Opus 4.6"},
-    {"id": "anthropic/claude-sonnet-4-5", "name": "Claude Sonnet 4.5"},
+    {"id": "~anthropic/claude-opus-latest", "name": "Claude Opus Latest"},
+    {"id": "~anthropic/claude-sonnet-latest", "name": "Claude Sonnet Latest"},
+    {"id": "~anthropic/claude-haiku-latest", "name": "Claude Haiku Latest"},
+    {"id": "anthropic/claude-opus-4.8", "name": "Claude Opus 4.8"},
+    {"id": "anthropic/claude-sonnet-4.6", "name": "Claude Sonnet 4.6"},
 ]
 
-# Max output tokens per model family (from Anthropic docs).
-# Checked against model_id which may have an "anthropic/" prefix.
-_MAX_OUTPUT = {
-    "claude-opus-4-6":   128_000,
-    "claude-sonnet-4-6":  64_000,
-    "claude-sonnet-4-5":  64_000,
-    "claude-opus-4-5":    64_000,
-    "claude-opus-4-1":    32_000,
-    "claude-sonnet-4":    64_000,
-    "claude-opus-4":      32_000,
-    "claude-haiku-4-5":   64_000,
-    "claude-haiku-3":      4_096,
-}
 _DEFAULT_MAX_OUTPUT = 8_192
-
-# Model families that support extended thinking (substring match on model ID).
-_THINKING_FAMILIES = ("claude-3-7", "claude-sonnet-4", "claude-opus-4", "claude-haiku-4")
-
-# 4.6 models use adaptive thinking by default; budget_tokens is deprecated.
-_ADAPTIVE_FAMILIES = ("claude-opus-4-6", "claude-sonnet-4-6")
-
-# 4.6 models support the effort parameter (output_config.effort).
-_EFFORT_FAMILIES = ("claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-5")
-
-# Models that support effort: "max" (only 4.6).
-_MAX_EFFORT_FAMILIES = ("claude-opus-4-6", "claude-sonnet-4-6")
 
 # Effort → proportion of max_tokens for budget_tokens calculation
 # (used for non-adaptive models when effort is specified instead of explicit budget).
@@ -75,42 +56,165 @@ _EFFORT_RATIOS = {
 
 
 def _model_name(model_id: str) -> str:
-    """Strip provider prefix, normalise dots→dashes for consistent matching."""
+    """Strip provider prefix (incl. OpenRouter '~'), normalise dots→dashes,
+    and drop the '-fast' speed suffix so capability matching is version-only."""
     name = model_id.split("/", 1)[-1] if "/" in model_id else model_id
-    return name.replace(".", "-")
+    name = name.lstrip("~").replace(".", "-")
+    if name.endswith("-fast"):
+        name = name[: -len("-fast")]
+    return name
+
+
+def _parse_version(model_id: str) -> tuple[str, int | None, int | None]:
+    """Parse a normalised model name into (family, major, minor).
+
+    family is 'opus' | 'sonnet' | 'haiku' | '' (unknown).
+    major/minor are None when absent.  '-latest' aliases carry no version,
+    so they parse to (family, None, None) and are treated as newest-gen.
+
+    Examples:
+      claude-opus-4-8         → ('opus', 4, 8)
+      claude-sonnet-4-6       → ('sonnet', 4, 6)
+      claude-opus-4-1         → ('opus', 4, 1)
+      claude-opus-4           → ('opus', 4, 0)
+      claude-3-7-sonnet       → ('sonnet', 3, 7)
+      claude-3-5-haiku        → ('haiku', 3, 5)
+      claude-opus-latest      → ('opus', None, None)
+    """
+    name = _model_name(model_id)
+    family = ""
+    for f in ("opus", "sonnet", "haiku"):
+        if f in name:
+            family = f
+            break
+
+    # New-style: claude-<family>-<major>[-<minor>]
+    m = re.search(rf"{family}-(\d+)(?:-(\d+))?", name) if family else None
+    if m:
+        major = int(m.group(1))
+        minor = int(m.group(2)) if m.group(2) is not None else 0
+        return family, major, minor
+
+    # Legacy-style: claude-<major>-<minor>-<family> (e.g. claude-3-7-sonnet)
+    # or single-major (e.g. claude-3-haiku).
+    m = re.search(r"claude-(\d+)(?:-(\d+))?", name)
+    if m:
+        major = int(m.group(1))
+        minor = int(m.group(2)) if m.group(2) is not None else 0
+        return family, major, minor
+
+    # '-latest' or otherwise unversioned: treat as newest generation.
+    return family, None, None
+
+
+def _is_newest_gen(model_id: str) -> bool:
+    """True when version is unknown ('-latest') — treat as current frontier."""
+    _, major, _ = _parse_version(model_id)
+    return major is None
 
 
 def _supports_thinking(model_id: str) -> bool:
-    name = _model_name(model_id)
-    return any(family in name for family in _THINKING_FAMILIES)
+    """Extended thinking (adaptive or budget): Claude 3.7+ and all 4.x."""
+    family, major, minor = _parse_version(model_id)
+    if not family:
+        return True  # unknown anthropic model: assume capable
+    if major is None:
+        return True  # latest alias
+    if major >= 4:
+        return True
+    if major == 3 and minor >= 7:
+        return True  # 3.7 Sonnet (extended thinking introduced here)
+    return False
 
 
 def _uses_adaptive_thinking(model_id: str) -> bool:
-    """True for 4.6 models where adaptive thinking replaces budget_tokens."""
-    name = _model_name(model_id)
-    return any(family in name for family in _ADAPTIVE_FAMILIES)
+    """True for 4.6+ models, where adaptive thinking is preferred/required.
+    On Opus 4.7+ it is the *only* supported mode (budget_tokens → 400)."""
+    family, major, minor = _parse_version(model_id)
+    if major is None:
+        return True  # latest alias → newest gen
+    if major < 4:
+        return False
+    return minor >= 6
+
+
+def _adaptive_only(model_id: str) -> bool:
+    """True for models that reject manual budget_tokens (400 error):
+    Opus 4.7 and later. Sonnet/Opus 4.6 still accept budget (deprecated)."""
+    family, major, minor = _parse_version(model_id)
+    if major is None:
+        return True  # latest alias → assume newest-gen, adaptive-only
+    if family == "opus" and major == 4 and minor >= 7:
+        return True
+    if major == 4 and minor >= 7:
+        return True  # future sonnet/haiku 4.7+ assumed adaptive-only too
+    return False
 
 
 def _supports_effort(model_id: str) -> bool:
-    """True for models supporting output_config.effort (verbosity)."""
-    name = _model_name(model_id)
-    return any(family in name for family in _EFFORT_FAMILIES)
+    """True for models supporting output_config.effort: Opus 4.5 and all 4.6+."""
+    family, major, minor = _parse_version(model_id)
+    if major is None:
+        return True
+    if major < 4:
+        return False
+    if minor >= 6:
+        return True
+    return family == "opus" and minor == 5  # Opus 4.5 supports effort
 
 
 def _supports_max_effort(model_id: str) -> bool:
-    """True for models supporting effort: 'max' (4.6 only)."""
-    name = _model_name(model_id)
-    return any(family in name for family in _MAX_EFFORT_FAMILIES)
+    """True for models supporting effort: 'max' — 4.6 and later."""
+    family, major, minor = _parse_version(model_id)
+    if major is None:
+        return True
+    return major >= 4 and minor >= 6
+
+
+def _supports_xhigh_effort(model_id: str) -> bool:
+    """True for models supporting effort: 'xhigh' — Opus 4.7 and later."""
+    family, major, minor = _parse_version(model_id)
+    if major is None:
+        return True
+    if family == "opus" and major == 4 and minor >= 7:
+        return True
+    return major == 4 and minor >= 7
 
 
 def _max_output_for_model(model_id: str) -> int:
-    """Return the max output token limit for a given model ID."""
-    name = _model_name(model_id)
-    if name in _MAX_OUTPUT:
-        return _MAX_OUTPUT[name]
-    for key, limit in _MAX_OUTPUT.items():
-        if name.startswith(key):
-            return limit
+    """Return the max output token limit for a given model ID.
+
+    Derived from (family, version) rather than a hardcoded table so new
+    releases get a sane default. Known caps (Anthropic docs):
+      Opus 4.6+:        128k    Opus 4.5 / 4.1 / 4.0: 32k–64k
+      Sonnet 4.x:        64k    Haiku 4.5:            64k
+      Claude 3.x Haiku: 4096
+    """
+    family, major, minor = _parse_version(model_id)
+
+    # Newest-gen alias or unknown version: assume frontier limits.
+    if major is None:
+        return 128_000 if family == "opus" else 64_000
+
+    if major >= 4:
+        if family == "opus":
+            if minor >= 6:
+                return 128_000
+            if minor >= 5:
+                return 64_000
+            if minor >= 1:
+                return 32_000
+            return 32_000  # Opus 4.0
+        # sonnet / haiku 4.x
+        return 64_000
+
+    if major == 3:
+        if family == "sonnet" and minor >= 7:
+            return 64_000  # 3.7 Sonnet
+        if family == "haiku":
+            return 4_096
+        return 4_096
+
     return _DEFAULT_MAX_OUTPUT
 
 
@@ -171,10 +275,12 @@ class Pipe:
                 resp = client.get(f"{self._base()}/models", headers=self._headers())
                 resp.raise_for_status()
             EXCLUDED = (":free", ":nitro", ":floor", ":extended")
+            # Match both 'anthropic/...' and OpenRouter's '~anthropic/...'
+            # latest-alias variants (e.g. ~anthropic/claude-opus-latest).
             models = [
                 {"id": m["id"], "name": m.get("name", m["id"])}
                 for m in resp.json().get("data", [])
-                if m["id"].startswith("anthropic/")
+                if m["id"].lstrip("~").startswith("anthropic/")
                 and not any(m["id"].endswith(s) for s in EXCLUDED)
             ]
             models.sort(key=lambda m: m["id"])
@@ -191,8 +297,15 @@ class Pipe:
             return "Error: API_KEY is not set. Ask your administrator to configure this pipe."
 
         model_id = body.get("model", "")
+        # OWUI prefixes the model with the pipe function id, e.g.
+        # "anthropic_via_openrouter.anthropic/claude-opus-4.8". Strip a single
+        # leading "<function_id>." prefix, but be careful: version dots like the
+        # "4.8" in the slug must NOT be split. We only strip when the remainder
+        # after the first dot looks like a provider slug (".../...").
         if "." in model_id:
-            model_id = model_id.split(".", 1)[1]
+            head, tail = model_id.split(".", 1)
+            if "/" in tail and "/" not in head:
+                model_id = tail
 
         system_text, oai_messages = self._split_system(body.get("messages", []))
         messages = self._convert_messages(oai_messages)
@@ -238,16 +351,18 @@ class Pipe:
         thinking_enabled = False
         if _supports_thinking(model_id):
             if _uses_adaptive_thinking(model_id):
-                # Claude 4.6: prefer adaptive thinking over budget_tokens.
+                # Claude 4.6+: prefer adaptive thinking over budget_tokens.
                 # Enable if: explicit budget given, effort specified, or enabled flag set.
                 should_think = bool(explicit_budget or effort not in ("", "none") or reasoning_enabled)
                 if should_think:
-                    if explicit_budget:
-                        # Caller gave an explicit budget — use budget-based (still supported).
+                    if explicit_budget and not _adaptive_only(model_id):
+                        # 4.6 still accepts an explicit budget (deprecated).
                         req["thinking"] = {"type": "enabled", "budget_tokens": int(explicit_budget)}
                     else:
                         # Adaptive: model decides how much to think; effort controls depth
-                        # via output_config.effort (handled below).
+                        # via output_config.effort (handled below). On Opus 4.7+ this is
+                        # the only accepted mode — an explicit budget would 400, so we
+                        # silently fall back to adaptive here.
                         req["thinking"] = {"type": "adaptive"}
                     thinking_enabled = True
             else:
@@ -275,21 +390,34 @@ class Pipe:
         verbosity = str(body.get("verbosity", "")).lower().strip()
         eff_source = effort or verbosity
         if eff_source and eff_source != "none" and _supports_effort(model_id):
-            # Map effort to Anthropic's output_config.effort values
-            eff_val = eff_source if eff_source in ("low", "medium", "high", "max") else "high"
-            if eff_val == "max" and not _supports_max_effort(model_id):
-                eff_val = "high"
-            # xhigh/minimal → nearest supported level
-            if eff_source == "xhigh":
-                eff_val = "max" if _supports_max_effort(model_id) else "high"
+            # Map the requested effort to Anthropic's output_config.effort,
+            # downgrading to the nearest level the target model supports.
+            #   low < medium < high < xhigh < max   (xhigh: Opus 4.7+; max: 4.6+)
+            if eff_source in ("low", "medium", "high"):
+                eff_val = eff_source
             elif eff_source == "minimal":
                 eff_val = "low"
+            elif eff_source == "xhigh":
+                eff_val = (
+                    "xhigh" if _supports_xhigh_effort(model_id)
+                    else "max" if _supports_max_effort(model_id)
+                    else "high"
+                )
+            elif eff_source == "max":
+                eff_val = "max" if _supports_max_effort(model_id) else "high"
+            else:
+                eff_val = "high"
             req["output_config"] = {"effort": eff_val}
 
-        # -- Sampling constraints when thinking is active --
+        # -- Sampling constraints --
         if thinking_enabled:
-            # Thinking requires temperature=1 and is incompatible with top_k/top_p
+            # Thinking requires temperature=1 and is incompatible with top_k/top_p.
             req["temperature"] = 1.0
+            if "stop" in body:
+                req["stop"] = body["stop"]
+        elif _adaptive_only(model_id):
+            # Opus 4.7+ reject temperature/top_p/top_k entirely (400). Forward
+            # only stop sequences.
             if "stop" in body:
                 req["stop"] = body["stop"]
         else:
@@ -493,11 +621,18 @@ class Pipe:
             text = "<think>" + "\n".join(thinking_parts) + "</think>\n\n" + text
 
         # ── Build OAI usage from Anthropic usage ─────────────────
+        # Anthropic reports input_tokens as the UNCACHED remainder only; the
+        # cache_read / cache_creation counts are reported separately and are
+        # NOT included in input_tokens. OpenAI semantics are the inverse:
+        # prompt_tokens is the grand total and cached_tokens is a subset of it.
+        # So we sum all input-side buckets to get prompt_tokens, keeping
+        # cached_tokens as a proper subset (cache_read).
         anthropic_usage = data.get("usage", {})
-        prompt_tokens = anthropic_usage.get("input_tokens", 0)
+        input_tokens = anthropic_usage.get("input_tokens", 0)
         completion_tokens = anthropic_usage.get("output_tokens", 0)
         cache_read = anthropic_usage.get("cache_read_input_tokens", 0)
         cache_write = anthropic_usage.get("cache_creation_input_tokens", 0)
+        prompt_tokens = input_tokens + cache_read + cache_write
         oai_usage = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -508,6 +643,9 @@ class Pipe:
                 "cached_tokens": cache_read,
                 "cache_write_tokens": cache_write,
             }
+        cost = anthropic_usage.get("cost")
+        if cost is not None:
+            oai_usage["cost"] = cost
 
         # ── Build response envelope ──────────────────────────────
         import uuid, time as _time
@@ -662,11 +800,18 @@ def _translate_event(event: dict, tool_blocks: dict) -> list:
 
 
 def _build_usage(usage: dict) -> dict:
-    """Build a standalone usage chunk for OWUI's info display."""
-    prompt = usage.get("input_tokens", 0)
+    """Build a standalone usage chunk for OWUI's info display.
+
+    Anthropic's input_tokens is the UNCACHED remainder only; cache_read and
+    cache_creation are reported separately and are not included in it. OpenAI
+    semantics require prompt_tokens to be the grand total with cached_tokens a
+    subset, so we sum all input buckets here too (mirrors _complete()).
+    """
+    input_tokens = usage.get("input_tokens", 0)
     completion = usage.get("output_tokens", 0)
     cache_read = usage.get("cache_read_input_tokens", 0)
     cache_write = usage.get("cache_creation_input_tokens", 0)
+    prompt = input_tokens + cache_read + cache_write
     cost = usage.get("cost")
     payload: dict = {
         "prompt_tokens": prompt,

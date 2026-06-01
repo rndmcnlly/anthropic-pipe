@@ -21,10 +21,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 from anthropic_via_openrouter import (
     Pipe,
     _model_name,
+    _parse_version,
     _supports_thinking,
     _uses_adaptive_thinking,
+    _adaptive_only,
     _supports_effort,
     _supports_max_effort,
+    _supports_xhigh_effort,
     _max_output_for_model,
     _EFFORT_RATIOS,
 )
@@ -62,42 +65,96 @@ def build_req(body: dict, model: str = "anthropic/claude-sonnet-4-6") -> dict:
 def test_model_helpers():
     print("── Model detection helpers ──")
 
+    # Version parsing (incl. fast variants and latest aliases)
+    assert _parse_version("anthropic/claude-opus-4.8") == ("opus", 4, 8)
+    assert _parse_version("anthropic/claude-opus-4.8-fast") == ("opus", 4, 8)
+    assert _parse_version("anthropic/claude-opus-4.7") == ("opus", 4, 7)
+    assert _parse_version("anthropic/claude-sonnet-4-6") == ("sonnet", 4, 6)
+    assert _parse_version("anthropic/claude-opus-4-1") == ("opus", 4, 1)
+    assert _parse_version("anthropic/claude-opus-4") == ("opus", 4, 0)
+    assert _parse_version("anthropic/claude-3-7-sonnet") == ("sonnet", 3, 7)
+    assert _parse_version("anthropic/claude-3-haiku") == ("haiku", 3, 0)
+    assert _parse_version("~anthropic/claude-opus-latest") == ("opus", None, None)
+    assert _parse_version("~anthropic/claude-sonnet-latest") == ("sonnet", None, None)
+    print("  _parse_version: PASS")
+
+    # _model_name strips ~ prefix and -fast suffix
+    assert _model_name("~anthropic/claude-opus-latest") == "claude-opus-latest"
+    assert _model_name("anthropic/claude-opus-4.8-fast") == "claude-opus-4-8"
+    print("  _model_name: PASS")
+
     # Thinking support
     assert _supports_thinking("anthropic/claude-sonnet-4-6")
     assert _supports_thinking("anthropic/claude-opus-4-6")
+    assert _supports_thinking("anthropic/claude-opus-4-7")
+    assert _supports_thinking("anthropic/claude-opus-4.8")
     assert _supports_thinking("anthropic/claude-sonnet-4-5")
     assert _supports_thinking("anthropic/claude-opus-4-5")
     assert _supports_thinking("anthropic/claude-3-7-sonnet")
     assert _supports_thinking("anthropic/claude-haiku-4-5")
-    assert not _supports_thinking("anthropic/claude-haiku-3")
+    assert _supports_thinking("~anthropic/claude-opus-latest")
+    assert not _supports_thinking("anthropic/claude-3-haiku")
     print("  _supports_thinking: PASS")
 
-    # Adaptive thinking (4.6 only)
+    # Adaptive thinking (4.6+)
     assert _uses_adaptive_thinking("anthropic/claude-sonnet-4-6")
     assert _uses_adaptive_thinking("anthropic/claude-opus-4-6")
+    assert _uses_adaptive_thinking("anthropic/claude-opus-4-7")
+    assert _uses_adaptive_thinking("anthropic/claude-opus-4.8")
+    assert _uses_adaptive_thinking("anthropic/claude-opus-4.8-fast")
+    assert _uses_adaptive_thinking("~anthropic/claude-opus-latest")
     assert not _uses_adaptive_thinking("anthropic/claude-sonnet-4-5")
     assert not _uses_adaptive_thinking("anthropic/claude-opus-4-5")
     assert not _uses_adaptive_thinking("anthropic/claude-3-7-sonnet")
     print("  _uses_adaptive_thinking: PASS")
 
+    # Adaptive-only (Opus 4.7+, rejects budget_tokens)
+    assert _adaptive_only("anthropic/claude-opus-4-7")
+    assert _adaptive_only("anthropic/claude-opus-4.8")
+    assert _adaptive_only("anthropic/claude-opus-4.8-fast")
+    assert _adaptive_only("~anthropic/claude-opus-latest")
+    assert not _adaptive_only("anthropic/claude-opus-4-6")  # 4.6 still accepts budget
+    assert not _adaptive_only("anthropic/claude-sonnet-4-6")
+    assert not _adaptive_only("anthropic/claude-sonnet-4-5")
+    print("  _adaptive_only: PASS")
+
     # Effort support
     assert _supports_effort("anthropic/claude-opus-4-6")
+    assert _supports_effort("anthropic/claude-opus-4-7")
+    assert _supports_effort("anthropic/claude-opus-4.8")
     assert _supports_effort("anthropic/claude-sonnet-4-6")
     assert _supports_effort("anthropic/claude-opus-4-5")
+    assert _supports_effort("~anthropic/claude-opus-latest")
     assert not _supports_effort("anthropic/claude-sonnet-4-5")
     assert not _supports_effort("anthropic/claude-3-7-sonnet")
     print("  _supports_effort: PASS")
 
-    # Max effort (4.6 only)
+    # Max effort (4.6+)
     assert _supports_max_effort("anthropic/claude-opus-4-6")
     assert _supports_max_effort("anthropic/claude-sonnet-4-6")
+    assert _supports_max_effort("anthropic/claude-opus-4-7")
+    assert _supports_max_effort("anthropic/claude-opus-4.8")
     assert not _supports_max_effort("anthropic/claude-opus-4-5")
     print("  _supports_max_effort: PASS")
 
+    # xhigh effort (Opus 4.7+)
+    assert _supports_xhigh_effort("anthropic/claude-opus-4-7")
+    assert _supports_xhigh_effort("anthropic/claude-opus-4.8")
+    assert _supports_xhigh_effort("~anthropic/claude-opus-latest")
+    assert not _supports_xhigh_effort("anthropic/claude-opus-4-6")
+    assert not _supports_xhigh_effort("anthropic/claude-sonnet-4-6")
+    print("  _supports_xhigh_effort: PASS")
+
     # Max output tokens
     assert _max_output_for_model("anthropic/claude-opus-4-6") == 128_000
+    assert _max_output_for_model("anthropic/claude-opus-4.8") == 128_000
+    assert _max_output_for_model("anthropic/claude-opus-4.8-fast") == 128_000
     assert _max_output_for_model("anthropic/claude-sonnet-4-6") == 64_000
     assert _max_output_for_model("anthropic/claude-sonnet-4-5") == 64_000
+    assert _max_output_for_model("anthropic/claude-opus-4-5") == 64_000
+    assert _max_output_for_model("anthropic/claude-opus-4-1") == 32_000
+    assert _max_output_for_model("~anthropic/claude-opus-latest") == 128_000
+    assert _max_output_for_model("~anthropic/claude-sonnet-latest") == 64_000
     print("  _max_output_for_model: PASS")
 
     print()
@@ -248,6 +305,68 @@ def test_max_effort_fallback_on_45():
     print()
 
 
+# ── New-model behavior: Opus 4.7/4.8, fast, latest ──
+
+def test_opus_47_adaptive_only_ignores_budget():
+    print("── Opus 4.7 + reasoning={max_tokens: 8000} → adaptive (budget rejected upstream) ──")
+    req = build_req({"reasoning": {"max_tokens": 8000}}, model="anthropic/claude-opus-4-7")
+    # Opus 4.7 rejects budget_tokens with 400, so we must coerce to adaptive.
+    assert req["thinking"] == {"type": "adaptive"}, f"got {req.get('thinking')}"
+    print(f"  thinking: {req['thinking']}")
+    print("  PASS")
+    print()
+
+
+def test_opus_48_xhigh_native():
+    print("── Opus 4.8 + reasoning_effort='xhigh' → adaptive + effort=xhigh (native) ──")
+    req = build_req({"reasoning_effort": "xhigh"}, model="anthropic/claude-opus-4.8")
+    assert req["thinking"] == {"type": "adaptive"}
+    assert req["output_config"] == {"effort": "xhigh"}, f"got {req.get('output_config')}"
+    print(f"  output_config: {req['output_config']}")
+    print("  PASS")
+    print()
+
+
+def test_opus_48_no_sampling_params():
+    print("── Opus 4.8 (no thinking) + temperature=0.5 → temperature dropped ──")
+    req = build_req({"temperature": 0.5}, model="anthropic/claude-opus-4.8")
+    # Adaptive-only models reject temperature/top_p/top_k.
+    assert "temperature" not in req, f"unexpected temperature: {req.get('temperature')}"
+    assert "top_p" not in req
+    print("  No sampling params forwarded: PASS")
+    print()
+
+
+def test_sonnet_46_xhigh_downgrades_to_max():
+    print("── Sonnet 4.6 + reasoning_effort='xhigh' → effort=max (no xhigh on 4.6) ──")
+    req = build_req({"reasoning_effort": "xhigh"}, model="anthropic/claude-sonnet-4-6")
+    assert req["output_config"] == {"effort": "max"}, f"got {req.get('output_config')}"
+    print(f"  output_config: {req['output_config']}")
+    print("  PASS")
+    print()
+
+
+def test_latest_alias_treated_as_newest_gen():
+    print("── ~anthropic/claude-opus-latest + reasoning_effort='xhigh' → adaptive + xhigh ──")
+    req = build_req({"reasoning_effort": "xhigh"}, model="~anthropic/claude-opus-latest")
+    assert req["thinking"] == {"type": "adaptive"}
+    assert req["output_config"] == {"effort": "xhigh"}
+    assert req["max_tokens"] == 128_000
+    print(f"  thinking: {req['thinking']}, output_config: {req['output_config']}, max_tokens: {req['max_tokens']}")
+    print("  PASS")
+    print()
+
+
+def test_fast_variant_matches_base():
+    print("── Opus 4.8-fast + reasoning_effort='max' → adaptive + effort=max ──")
+    req = build_req({"reasoning_effort": "max"}, model="anthropic/claude-opus-4.8-fast")
+    assert req["thinking"] == {"type": "adaptive"}
+    assert req["output_config"] == {"effort": "max"}
+    print(f"  thinking: {req['thinking']}, output_config: {req['output_config']}")
+    print("  PASS")
+    print()
+
+
 # ── Integration test: live API call ──
 
 async def test_live_api():
@@ -315,6 +434,13 @@ if __name__ == "__main__":
     test_pre46_raw_integer()
     test_none_disables()
     test_max_effort_fallback_on_45()
+
+    test_opus_47_adaptive_only_ignores_budget()
+    test_opus_48_xhigh_native()
+    test_opus_48_no_sampling_params()
+    test_sonnet_46_xhigh_downgrades_to_max()
+    test_latest_alias_treated_as_newest_gen()
+    test_fast_variant_matches_base()
 
     print("=" * 60)
     print("All unit tests passed. Running live API test...")
