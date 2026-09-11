@@ -171,6 +171,15 @@ def test_no_reasoning():
     print()
 
 
+def test_model_discovery_headers():
+    print("── Model discovery omits Anthropic Messages header ──")
+    pipe = Pipe()
+    assert "anthropic-version" in pipe._headers()
+    assert "anthropic-version" not in pipe._headers(anthropic=False)
+    print("  Discovery headers: PASS")
+    print()
+
+
 def test_adaptive_thinking_via_reasoning_effort():
     print("── Claude 4.6 + reasoning_effort='medium' → adaptive thinking + effort ──")
     req = build_req({"reasoning_effort": "medium"})
@@ -421,6 +430,7 @@ async def test_live_api():
 if __name__ == "__main__":
     test_model_helpers()
     test_no_reasoning()
+    test_model_discovery_headers()
     test_adaptive_thinking_via_reasoning_effort()
     test_adaptive_thinking_via_reasoning_object()
     test_adaptive_with_explicit_budget()

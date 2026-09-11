@@ -251,7 +251,7 @@ class Pipe:
     def _base(self) -> str:
         return self.valves.API_BASE_URL.rstrip("/")
 
-    def _headers(self) -> dict:
+    def _headers(self, *, anthropic: bool = True) -> dict:
         auth = (
             {"x-api-key": self.valves.API_KEY}
             if self.valves.AUTH_TYPE == "x-api-key"
@@ -262,7 +262,10 @@ class Pipe:
             if "openrouter.ai" in self._base()
             else {}
         )
-        return {**auth, **or_attribution, "anthropic-version": ANTHROPIC_VERSION, "Content-Type": "application/json"}
+        headers = {**auth, **or_attribution, "Content-Type": "application/json"}
+        if anthropic:
+            headers["anthropic-version"] = ANTHROPIC_VERSION
+        return headers
 
     # ------------------------------------------------------------------
     # Model list
@@ -272,13 +275,19 @@ class Pipe:
             return self._models_cache
         try:
             with httpx.Client(timeout=10) as client:
-                resp = client.get(f"{self._base()}/models", headers=self._headers())
+                # OpenRouter changes /models semantics when the Anthropic
+                # Messages header is present, returning synthetic provider
+                # slugs (including non-Anthropic models). Discovery is an
+                # OpenRouter API request, not an Anthropic Messages request.
+                resp = client.get(
+                    f"{self._base()}/models", headers=self._headers(anthropic=False)
+                )
                 resp.raise_for_status()
             EXCLUDED = (":free", ":nitro", ":floor", ":extended")
             # Match both 'anthropic/...' and OpenRouter's '~anthropic/...'
             # latest-alias variants (e.g. ~anthropic/claude-opus-latest).
             models = [
-                {"id": m["id"], "name": m.get("name", m["id"])}
+                {"id": m["id"], "name": m.get("name") or m["id"]}
                 for m in resp.json().get("data", [])
                 if m["id"].lstrip("~").startswith("anthropic/")
                 and not any(m["id"].endswith(s) for s in EXCLUDED)
